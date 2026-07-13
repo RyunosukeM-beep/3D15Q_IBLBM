@@ -41,7 +41,7 @@ By default, the simulation is performed under the following conditions.
 On an HPC cluster environment, the following modules must be loaded before compilation and execution.
 
 ```bash
-module load hpcz
+module load hpc_sdk
 module load hdf5_pararell
 ```
 

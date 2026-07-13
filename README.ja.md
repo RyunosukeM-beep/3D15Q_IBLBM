@@ -41,7 +41,7 @@ Immersed Boundary Lattice Boltzmann Method (IB-LBM) [[2]](#reference) を用い�
 HPC クラスタ環境では、コンパイル・実行前に以下のモジュールをロードする必要がある。
 
 ```bash
-module load hpcz
+module load hpc_sdk
 module load hdf5_pararell
 ```
 
