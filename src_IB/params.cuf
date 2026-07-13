@@ -1,0 +1,185 @@
+module kinds
+  use iso_fortran_env, only: dp => real32
+  character(len=*), parameter :: VARIMODE = "Single" !倍精度　Double 単精度　Single
+  !integer, parameter :: dp = selected_real_kind(6, 37)
+end module kinds
+
+module LBMparams
+    use kinds
+    implicit none
+    !-----実験を用いるときに使う次元ありの数--------------
+    integer, parameter :: ratio(3) = [1,1,4]
+    integer, parameter :: resol = 1
+    integer, parameter :: NX=128*ratio(1)*resol, NY=128*ratio(2)*resol, NZ=128*ratio(3)*resol ! 格子点の数
+    integer,device :: dNX=NX,dNY=NY,dNZ=NZ ! 格子点の数
+    real(dp), parameter :: mainL = 1.0_dp
+    real(dp), parameter :: hdelta_t = 1.0e-2_dp/2.0_dp
+    real(dp),device :: delta_t
+    real(dp), parameter :: hmain_U = 0.1_dp
+    real(dp),device :: main_U
+    real(dp), parameter :: Reynolds = 100
+    real(dp), parameter :: dx = (mainL*ratio(1))/NX,dy = (mainL*ratio(2))/NY,dz = (mainL*ratio(3))/NZ
+    real(dp),device :: ddx,ddy,ddz
+    real(dp),device :: inv_dx,inv_dy,inv_dz
+    real(dp), parameter :: dxinv = NX/(mainL*ratio(1)),dyinv = NY/(mainL*ratio(2)), dzinv = NZ/(mainL*ratio(3))
+    ! 緩和速度 (>0.5 for stability typically)
+    real(dp), parameter :: nu_fluid = 1/Reynolds
+
+    real(dp),parameter :: htau = 0.6_dp
+    real(dp),device :: tau
+
+    !発散の判定
+    real(dp),parameter :: div_eps = 1.0e4_dp
+    
+    character(len=16):: ActiveOutput = "True"
+    character(len=16):: Testmode = "deactive"
+    character(len=16):: DoIBroutine = "Active"
+
+    ! --- Global grid (adjust as needed) --- 
+    
+    integer, parameter :: Q=15 !3D15Qモデルを用いるので、方向は合計で１５ある
+    integer,device :: dQ
+    real(dp),parameter :: hrho0 =1.0_dp !基本となる密度　1.0d0
+    real(dp),device :: rho0
+    real(dp),device :: rho_in
+    real(dp),device :: rho_in_inv
+    real(dp),device :: rho_out
+    real(dp),device :: uwall !壁の速度
+    integer,parameter :: n_start=0
+    integer :: n_end = 5000 !プログラムのステップ数
+    integer :: outputstep = 100
+
+    ! --- Physical / model params --22-           
+    real(dp), parameter :: homega = 1.0_dp/htau   
+    real(dp), device :: omega     ! collision freq
+    real(dp), parameter :: cs2 = 1.0_dp/3.0_dp       ! c_s^2 fo r LBM
+    real(dp), parameter :: hRT = 1.0_dp/3.0_dp  !R(gas constant) * T (tempreture)
+    real(dp),device :: RT 
+    real(dp), parameter :: RRT = 3.0_dp
+    real(dp), parameter :: hdelta_rho = 0.1_dp
+    real(dp), device :: delta_rho
+
+    integer,parameter :: BC = 1
+    ! Initial velocity (dimensionless lattice units)
+    real(dp), parameter :: hu0(3) = [0.0_dp, 0.0_dp, 0.01_dp]
+    real(dp), device :: u0(3)
+    !出力回数を指定する変数
+    integer, parameter :: savestep = 100
+
+    !--------mpi並列化のときに用いる定数------------
+    integer,parameter :: lenghost = 2
+
+    character(len=*),parameter :: OUTPUT_DIR = "./output"
+    character(len=*),parameter :: OUTPUT_DIR_TMP = "./tmp_output"
+    end module LBMparams
+
+  module overlap_buf
+    use cudafor
+    use kinds
+    implicit none
+
+    real(dp), dimension(:,:,:), allocatable, device :: ux_buf, uy_buf, uz_buf, rho_buf, pres_buf
+
+    ! pinned ホストメモリ（DMA転送高速化）
+    real(dp), dimension(:,:,:), allocatable, pinned :: ux_h, uy_h, uz_h, rho_h, pres_h
+  end module overlap_buf
+
+  module CUDA_PARAMS
+    use kinds
+    implicit none
+    integer,parameter :: gridsize_x = 8
+    integer,parameter :: gridsize_y = 8
+    integer,parameter :: gridsize_z = 8
+
+  end module CUDA_PARAMS
+
+  module boundval
+    use kinds
+    integer(4),dimension(:,:,:),allocatable :: boundary_d !壁面の指定をするための変数
+    integer(4),dimension(:,:,:),allocatable,device :: boundary
+
+    real(dp),dimension(:)  , allocatable :: umean !速度平均
+    integer(4), dimension(:,:,:),allocatable,device ::boundary2
+  end module boundval
+
+  module grobalboundval
+    use kinds
+    integer(4),dimension(:,:,:), allocatable :: gboundary
+
+  end module grobalboundval
+
+  module macroval 
+    use kinds
+    real(dp),dimension(:,:,:),allocatable,device ::ux,uy,uz,rho,pres
+    real(dp),dimension(:,:,:),allocatable,device :: tmpux,tmpuy,tmpuz
+    real(dp),dimension(:,:,:),allocatable ::ux_d,uy_d,uz_d,rho_d,pres_d
+  end module macroval
+
+  module latticeval
+    use kinds
+    real(dp), parameter :: cx1(15) = (/0.0_dp, 1.0_dp,-1.0_dp, 0.0_dp, 0.0_dp, &
+                                    0.0_dp, 0.0_dp, 1.0_dp,-1.0_dp, 1.0_dp, &
+                                   -1.0_dp, 1.0_dp,-1.0_dp, 1.0_dp,-1.0_dp/)
+    real(dp), parameter :: cy1(15) = (/0.0_dp, 0.0_dp, 0.0_dp, 1.0_dp,-1.0_dp, &
+                                    0.0_dp, 0.0_dp, 1.0_dp,-1.0_dp, 1.0_dp, &
+                                   -1.0_dp,-1.0_dp, 1.0_dp,-1.0_dp, 1.0_dp/)
+    real(dp), parameter :: cz1(15) = (/0.0_dp, 0.0_dp, 0.0_dp, 0.0_dp, 0.0_dp, &
+                                    1.0_dp,-1.0_dp, 1.0_dp,-1.0_dp,-1.0_dp, &
+                                    1.0_dp, 1.0_dp,-1.0_dp,-1.0_dp, 1.0_dp/)
+    real(dp),device :: cx(15),cy(15),cz(15)
+    real(dp), parameter :: wa2(15) = [ &
+    2.0_dp/9.0_dp, &
+    1.0_dp/9.0_dp, 1.0_dp/9.0_dp, 1.0_dp/9.0_dp, 1.0_dp/9.0_dp, 1.0_dp/9.0_dp, 1.0_dp/9.0_dp, &
+    1.0_dp/72.0_dp, 1.0_dp/72.0_dp, 1.0_dp/72.0_dp, 1.0_dp/72.0_dp, &
+    1.0_dp/72.0_dp, 1.0_dp/72.0_dp, 1.0_dp/72.0_dp, 1.0_dp/72.0_dp ]
+    real(dp),device :: wa(15)
+    integer,parameter :: hopp(15) = (/1,3,2,5,4,7,6,9,8,11,10,13,12,15,14/)
+    integer,device :: opp(15)
+    integer, dimension(5) :: upper = [7,9,10,13,14]
+    integer, dimension(5) :: under = [6,8,11,12,15]
+    integer, dimension(2) :: frontback = [5,6]
+    integer, dimension(4) :: h_inlet = [7,10,11,14]
+    integer, dimension(4),device :: inlet
+    integer, parameter :: h_outlet(4) =[8,9,12,13]
+    integer, dimension(4),device :: outlet
+  end module latticeval 
+
+  module distfunc 
+    use kinds
+    real(dp),dimension(:,:,:,:),allocatable :: f 
+  end module distfunc
+
+  module extforce
+    use kinds
+    real(dp),parameter :: forcex_h = 0.0_dp
+    real(dp),parameter :: forcey_h = 0.0_dp!-0.0098065_dp
+    real(dp),parameter :: forcez_h = 0.0_dp !無次元化前の値を用いる　ここでは重力加速度
+    real(dp),device :: forcex,forcey,forcez
+  end module extforce
+
+  module localdistfunc
+    use kinds
+    real(dp),dimension(:,:,:,:),allocatable,device :: localdistf
+    real(dp),dimension(:,:,:,:),allocatable,device :: localtmpf
+  end module localdistfunc
+
+  module streamtmp
+    use kinds
+    real(dp),dimension(:,:,:,:),allocatable :: tmpf
+  end module streamtmp
+
+  module mpiparams
+    integer :: nprank
+  end module mpiparams
+
+  module sendbuffs
+    use kinds
+    real(dp), allocatable :: sendbuf(:),sendbufu(:),sendbufv(:),sendbufw(:)
+    integer, allocatable :: recvcounts(:),recvcounts2(:), displs(:),displs2(:)
+  end module sendbuffs
+
+  module ghost
+    use kinds
+    real(dp),allocatable :: sendupghost(:),recivupghost(:)
+    real(dp),allocatable :: senddownghost(:),recivdownghost(:)
+  end module ghost

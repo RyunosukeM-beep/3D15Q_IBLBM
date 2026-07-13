@@ -1,0 +1,16 @@
+*.jpg
+*.png
+*.h5
+*.xdmf
+*.vtk
+*.o
+*.mod
+Run_*
+tmp*
+lbm_sng.f90
+*profile*
+*.txt
+*flow*
+*flowdata*
+*.env
+*.key

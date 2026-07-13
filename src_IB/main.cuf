@@ -1,0 +1,207 @@
+program LBMmain
+    use kinds
+    use cudafor
+    use mpi
+    use hdf5output     
+    use LBMparams
+    use distfunc
+    use macroval
+    use LBMroutines
+    use CUDA_PARAMS
+    use boundval
+    use localdistfunc
+    use overlap_buf !このモジュールはoverlapのバッファで必須
+    use information
+    use IBMparams
+    use IBMroutines
+    implicit none
+
+    real(dp)  ntime
+    real(dp)  maxvel,meanvel,meanvel_local,ptotal,rtotal
+    real(dp)  ks,ke,ktotal
+    integer :: step
+    integer :: i,j,k,l,m
+    integer :: sendcount,parent,sendcount2,stat
+    type(dim3) :: grid, block
+    integer :: istat
+    !以下はmpiの変数
+    integer :: np,ierr,rank
+
+    integer :: count_outputfiles
+
+    !streamとeventの定義が違うので注意
+    integer(kind=cuda_stream_kind) :: s_compute, s_io
+    type(cudaEvent)                :: e_copied, e_io_done
+
+    integer(kind=8) :: nbytes
+    character(64) :: outdir
+    character(len=256) :: comment = ""
+    
+    !ここからmpiの部分
+    call mpi_init(ierr)
+    !このプログラムを実行しているノードが何番目か（０からはじまる）を取得
+    call mpi_comm_size(mpi_comm_world, np, ierr)
+    call mpi_comm_rank(mpi_comm_world, rank, ierr)
+
+    rank = 0
+
+    
+    block = dim3(gridsize_x,gridsize_y,gridsize_z)
+    grid  = dim3((Nx + gridsize_x-1)/gridsize_x,(NY+gridsize_y-1)/gridsize_y,(NZ+gridsize_z-1)/gridsize_z)
+
+    !出力するディレクトリ，メモの作成の作成
+    
+    
+    call load_args(comment)
+    
+    if(ActiveOutput == "True") then
+        call make_output_dir(outdir)
+        call write_config(outdir,comment)
+    endif
+    write(6,*) "set grid"
+    call allocatevals()
+    write(6,*) "allocated vals"
+    call initialize<<<grid,block>>>()
+    istat = cudaDeviceSynchronize()
+    write(6,*) "initialized vals "
+    istat = cudaDeviceSynchronize()
+    call setboundary()
+    write(6,*) "set boundary"
+
+    !出力ファイル数カウントの初期化
+    count_outputfiles = 0
+
+    !IBの初期化
+    call init_sphere_lagrange()
+
+    if(ActiveOutput=="True") then
+        call write_particles_hdf5(count_outputfiles*outputstep, outdir)   
+    end if
+    call IBinit()
+    istat = cudaDeviceSynchronize()
+    boundary = boundary_d
+    boundary_d = boundary
+    f = localdistf
+    rho_d = rho
+    ux_d = ux
+
+    !-----------表示部分-------------------------------------------------------------------------
+    if(rank == 0) then
+        !----print title------------
+
+            write(6,*) 
+            write(6,*) '            Lattice Boltzmann Method'
+            write(6,*) '      based on 3-D Square Latteice (3D15Q)'
+            write(6,*) 'fluid model (X.He,R.Zhang,S.Chen and G.D.Doolen)'
+            write(6,*)
+
+        !----- allocate valiables ----------------------------------
+        write(*,'(a)') 'LBM D3Q15 is ready'
+        write(*,'(a,i0,a,i0,a,i0)') 'Grid size: ', NX, ' x ', NY, ' x ', NZ
+        write(*,'(a,f10.6,a,f10.6,a,f10.6)') 'Grid scale: ', dx, ' x ', dy, ' x ', dz
+        write(*,'(a,f10.6)') 'Re = ', Reynolds
+        write(*,'(a,f6.3)') 'tau = ', htau
+        write(*,'(a,f6.3)') 'mainU = ', hmain_U
+
+        write(6,*) '-------------------------------------------'
+        write(*,'(a,i0)') 'step', 0 
+        write(6,*) '-------------------------------------------'
+        write(*,*) 'rho range:', minval(rho_d), maxval(rho_d)
+        write(*,*) 'ux range:', minval(ux_d), maxval(ux_d)
+        write(*,*) 'f range:', minval(f), maxval(f)
+        write(*,*) 'boundary range:', minval(boundary_d), maxval(boundary_d)
+
+    endif
+    call calcmacro<<<grid,block>>>()
+    stat = cudaDeviceSynchronize()
+
+    ux_d = ux; uy_d = uy; uz_d = uz; rho_d = rho; 
+    step = 0
+    print *, 'max|u|=', maxval(sqrt(ux_h**2+uy_h**2+uz_h**2))
+    if(ActiveOutput=="True") then
+        call write_hdf5(count_outputfiles * outputstep, ux_d, uy_d, uz_d, rho_d,outdir)
+        !call write_particles_hdf5(count_outputfiles*outputstep, outdir)   
+    end if
+    count_outputfiles = count_outputfiles + 1
+
+    !Cudastreamの初期化
+    istat = cudaStreamCreate(s_compute)
+    istat = cudaStreamCreate(s_io)
+    istat = cudaEventCreate(e_copied)
+
+    
+
+    if(BC==1) then !Bounceback条件
+        do step = 1, n_end
+
+        if(rank == 0) then
+            print *, 'step=',step
+        endif
+
+        ! --- 出力処理（前回分）---
+        if(mod(step,outputstep) == 1 .and. step > 1) then
+            ux_h = ux; uy_h =uy; uz_h = uz; rho_h = rho;
+            ! CPUで処理
+            print *, 'max|u|=', maxval(sqrt(ux_h**2+uy_h**2+uz_h**2))
+            if(maxval(sqrt(ux_h**2+uy_h**2+uz_h**2)) >= div_eps ) then
+                !call MPI_Abort(MPI_COMM_WORLD, 1, ierr)
+            end if
+            if(ActiveOutput=="True") then
+                call write_hdf5(count_outputfiles * outputstep, ux_h, uy_h, uz_h, rho_h,outdir)
+                call write_particles_hdf5(count_outputfiles*outputstep, outdir)
+            endif
+            count_outputfiles = count_outputfiles + 1
+
+        end if
+
+        ! --- GPU計算 ---
+        call collide<<<grid,block>>>() !一時的な分布関数を得る
+        call copy_kernel<<<grid,block>>>()
+        call streaming<<<grid,block>>>()
+        call calcmacro<<<grid,block>>>()
+        
+        if(DoIBroutine == "Active") then
+            call copy_kernel_u<<<grid,block>>>()
+            !-----IB計算（体積力）------
+            do m = 1, MDFNnp
+                test = 0
+                call calc_pstd<<<gridIB,blockIB>>>()
+                call calc_pstd_collect<<<gridIB,blockIB>>>()   ! ← 修正
+                htest = test
+            
+                if(m==1) then
+                    call init_G<<<gridIB,blockIB>>>()
+                else 
+                    call correct_G<<<gridIB,blockIB>>>() ! ← 修正
+                endif
+                call copy_kernel_u<<<grid,block>>>()
+                call calc_spread<<<gridIB,blockIB>>>()
+                !収束判定
+                heps = eps
+                if((abs(sum(heps)/size(heps))) <= eps_condition) then 
+                    exit
+                end if
+            end do
+            print *, "IBitr = ",m ,abs(sum(heps)/size(heps))
+            !print *, sum(htest),m
+            !----IB計算（分布補正）-------
+            call collide_G<<<gridIB,blockIB>>>()
+
+            call calcmacro<<<grid,block>>>()
+        endif
+
+        
+
+        end do
+        ! 最終ステップ出力
+        if(mod(n_end, outputstep) == 0) then
+            ux_h = ux; uy_h =uy; uz_h = uz; rho_h = rho;
+            print *, 'max|u|=', maxval(sqrt(ux_h**2+uy_h**2+uz_h**2))
+            if(ActiveOutput=="True") then
+                call write_hdf5(count_outputfiles * outputstep, ux_h, uy_h, uz_h, rho_h,outdir)
+                call write_particles_hdf5(count_outputfiles*outputstep, outdir)
+            end if
+        end if
+    end if
+    call mpi_finalize(ierr)
+end program LBMmain

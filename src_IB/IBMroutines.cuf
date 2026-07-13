@@ -1,0 +1,380 @@
+module IBMroutines
+use kinds
+use LBMparams
+use IBMparams
+use macroval
+use cudafor
+implicit none
+contains
+
+subroutine IBinit
+    implicit none
+    integer k
+    !allocate(p_pos(3,numpoints))
+    allocate(p_vel(3,numpoints))
+    allocate(collect_tmp(3,16,numpoints))
+    allocate(collect_tmp_G(3,16,numpoints))
+    allocate(Gforce(3,numpoints))
+    allocate(vel_pstd(3,numpoints))
+    allocate(heps(numpoints))
+    allocate(eps(numpoints))
+    allocate(test(numpoints,17))
+    allocate(htest(numpoints,17))
+    allocate(tmpux(NX,NY,NZ));allocate(tmpuy(NX,NY,NZ));allocate(tmpuz(NX,NY,NZ))
+    !allocate(latticeF(3,dnx,dny,dnz))
+    !粒子の初期条件設定部分
+    do k = 1,numpoints
+        p_vel(1,k) = pvel0(1)
+        p_vel(2,k) = pvel0(2)
+        p_vel(3,k) = pvel0(3)
+    end do
+    dV = hdv
+    dnumpoints = numpoints
+
+end subroutine IBinit
+
+subroutine init_sphere_lagrange
+    implicit none            ! 点間の平均距離
+    integer  :: k,istat
+    real(dp) :: pi = 3.14159265358979323846_dp
+    real(dp) :: ds
+    real(dp), allocatable :: p_pos_h(:,:)
+
+    ! dx に近い間隔になるnumpointsを計算
+    ! ds ≈ sqrt(4πR² / numpoints) → numpoints ≈ 4πR² / dx²
+    numpoints = nint(4.0_dp * pi * (hradius*dx)**2 / dx**2)
+    if (numpoints < 1) numpoints = 1
+
+    
+    
+    allocate(p_pos(3, numpoints))
+
+    gridIB = dim3((numpoints+31)/32, 1, 1)
+    gridIB2  = dim3((numpoints+127)/128, 1, 1)
+
+    print *, "gridIB = ", gridIB%x, gridIB%y, gridIB%z
+    print *, "blockIB = ", blockIB%x, blockIB%y, blockIB%z
+    print *, "numpoints = ", numpoints
+
+    dnumpoints=numpoints
+    radius = hradius
+    center = hcenter
+
+    allocate(p_pos_h(3, numpoints))
+
+    call set_position<<<gridIB2,blockIB2>>>()
+    istat = cudaDeviceSynchronize()
+    print *, istat
+    istat = cudaGetLastError()
+    print *, "cuda error =", istat
+
+    p_pos_h = p_pos
+
+    print *, p_pos_h(:,1)
+    print *, p_pos_h(:,2)
+    print *, p_pos_h(:,3)
+    print *, p_pos_h(:,10)
+
+    deallocate(p_pos_h)
+    ! 実際の点間距離
+    ds = sqrt(4.0_dp * pi * (hradius*dx)**2 / real(numpoints, dp))
+    hdv = ds*ds
+    dds = ds
+    ds_lat = ds/dx
+    print *, "Numpoints = ", numpoints
+    print *, "ds = ", ds
+    print *, "dx = ", dx
+end subroutine init_sphere_lagrange
+
+attributes(global) subroutine copy_kernel_u()
+        implicit none
+        integer :: i,j,k,l
+
+        i = (blockIdx%x-1)*blockDim%x + threadIdx%x
+        j = (blockIdx%y-1)*blockDim%y + threadIdx%y
+        k = (blockIdx%z-1)*blockDim%z + threadIdx%z
+
+        if (i<=dNX .and. j<=dNY .and. k<=dNZ) then
+            tmpux(i,j,k) = ux(i,j,k)
+            tmpuy(i,j,k) = uy(i,j,k)
+            tmpuz(i,j,k) = uz(i,j,k)
+        end if
+
+    end subroutine
+
+attributes(global) subroutine set_position
+    implicit none
+    real(dp) :: golden, theta, phi, x, y, z
+    real(dp),parameter :: dpi = 3.14159265358979323846_dp
+    integer :: k
+    k = (blockIdx%x - 1)*blockDim%x + threadIdx%x
+    if (k < 1 .or. k > dnumpoints) return
+
+    golden = (1.0_dp + sqrt(5.0_dp)) / 2.0_dp
+    z     = 1.0_dp - (2.0_dp * real(k-1, dp) + 1.0_dp) / real(dnumpoints, dp)
+    theta = acos(z)
+    phi   = 2.0_dp * dpi * real(k-1, dp) / golden
+
+    p_pos(1, k) = center(1)*ddx + radius*ddx * sin(theta) * cos(phi)
+    p_pos(2, k) = center(2)*ddx + radius*ddx * sin(theta) * sin(phi)
+    p_pos(3, k) = center(3)*ddx + radius*ddx * z    
+end subroutine set_position
+
+attributes(global) subroutine calc_pstd !blockIBで呼び出す
+    implicit none
+    integer :: k, ix, i0, j0, k0, id
+    integer :: iy, iz
+    real(dp) :: d, rx, ry, rz, ar, phi_x, phi_y, phi_z
+
+    k  = (blockIdx%x - 1)*blockDim%x + threadIdx%x
+    iy = threadIdx%y
+    iz = threadIdx%z
+    id = (iz - 1)*4 + iy
+    if (k > dnumpoints) return
+
+        !変数の初期化
+    collect_tmp(1,id,k) = 0.0_dp
+    collect_tmp(2,id,k) = 0.0_dp
+    collect_tmp(3,id,k) = 0.0_dp
+
+    i0 = floor(p_pos(1,k)/ddx) - 1
+    j0 = floor(p_pos(2,k)/ddy) - 1 + iy
+    k0 = floor(p_pos(3,k)/ddz) - 1 + iz
+
+    test(k,id) = 1
+
+    ! y,z方向のφは毎回同じなので先に計算
+    ry = (real(j0)*ddy - p_pos(2,k)) / ddx
+    rz = (real(k0)*ddz - p_pos(3,k)) / ddx
+
+    ! peskin_phi(ry)
+    ar = abs(ry)
+    if (ar < 1.0_dp) then
+        phi_y = (3.0_dp - 2.0_dp*ar + sqrt(1.0_dp + 4.0_dp*ar - 4.0_dp*ar*ar)) / 8.0_dp
+    else if (ar < 2.0_dp) then
+        phi_y = (5.0_dp - 2.0_dp*ar - sqrt(-7.0_dp + 12.0_dp*ar - 4.0_dp*ar*ar)) / 8.0_dp
+    else
+        phi_y = 0.0_dp
+    end if
+
+    ! peskin_phi(rz)
+    ar = abs(rz)
+    if (ar < 1.0_dp) then
+        phi_z = (3.0_dp - 2.0_dp*ar + sqrt(1.0_dp + 4.0_dp*ar - 4.0_dp*ar*ar)) / 8.0_dp
+    else if (ar < 2.0_dp) then
+        phi_z = (5.0_dp - 2.0_dp*ar - sqrt(-7.0_dp + 12.0_dp*ar - 4.0_dp*ar*ar)) / 8.0_dp
+    else
+        phi_z = 0.0_dp
+    end if
+
+    do ix = i0, i0+3
+        rx = (real(ix)*ddx - p_pos(1,k)) / ddx
+        ar = abs(rx)
+        if (ar < 1.0_dp) then
+            phi_x = (3.0_dp - 2.0_dp*ar + sqrt(1.0_dp + 4.0_dp*ar - 4.0_dp*ar*ar)) / 8.0_dp
+        else if (ar < 2.0_dp) then
+            phi_x = (5.0_dp - 2.0_dp*ar - sqrt(-7.0_dp + 12.0_dp*ar - 4.0_dp*ar*ar)) / 8.0_dp
+        else
+            phi_x = 0.0_dp
+        end if
+
+        d = phi_x * phi_y * phi_z 
+
+        collect_tmp(1,id,k) = collect_tmp(1,id,k) + tmpux(modulo(ix-1,dNX)+1, modulo(j0-1,dNY)+1, modulo(k0-1,dNZ)+1) * d
+        collect_tmp(2,id,k) = collect_tmp(2,id,k) + tmpuy(modulo(ix-1,dNX)+1, modulo(j0-1,dNY)+1, modulo(k0-1,dNZ)+1) * d
+        collect_tmp(3,id,k) = collect_tmp(3,id,k) + tmpuz(modulo(ix-1,dNX)+1, modulo(j0-1,dNY)+1, modulo(k0-1,dNZ)+1) * d
+    end do
+
+end subroutine calc_pstd
+
+attributes(global) subroutine calc_pstd_collect
+    implicit none
+    integer :: k ,i
+    k = (blockIdx%x - 1)*blockDim%x + threadIdx%x
+    if (k > dnumpoints) return
+    vel_pstd(1,k) = collect_tmp(1,1,k)
+    vel_pstd(2,k) = collect_tmp(2,1,k)
+    vel_pstd(3,k) = collect_tmp(3,1,k)
+    
+    test(k,17) = 1
+    do i = 2, 16
+        vel_pstd(1,k) = vel_pstd(1,k) + collect_tmp(1,i,k)
+        vel_pstd(2,k) = vel_pstd(2,k) + collect_tmp(2,i,k)
+        vel_pstd(3,k) = vel_pstd(3,k) + collect_tmp(3,i,k)
+    end do 
+end subroutine calc_pstd_collect
+
+attributes(global) subroutine init_G !初期の体積力の計算
+    implicit none
+    integer :: k ,i
+    real(dp) :: err
+    k = (blockIdx%x - 1)*blockDim%x + threadIdx%x
+    err = 0.0_dp
+    if (k > dnumpoints) return
+    do i = 1,3
+        err = err + (p_vel(i,k) - vel_pstd(i,k))
+        Gforce(i,k) = (p_vel(i,k) - vel_pstd(i,k))
+    end do
+    eps(k) = err*0.3333
+end subroutine init_G
+
+attributes(global) subroutine correct_G !初期の体積力の計算
+    implicit none
+    integer :: k ,i
+    real(dp) :: err
+    k = (blockIdx%x - 1)*blockDim%x + threadIdx%x
+    if (k > dnumpoints) return
+    err = 0.0_dp
+    do i = 1,3
+        err = err + (p_vel(i,k) - vel_pstd(i,k))
+        Gforce(i,k) = Gforce(i,k) +  (p_vel(i,k) - vel_pstd(i,k))
+    end do 
+    eps(k) = err*0.333
+end subroutine correct_G
+
+attributes(global) subroutine calc_spread !blockIBで呼び出す
+    implicit none
+    integer :: k, ix, iy_l, iz_l, gx, gy, gz
+    integer :: iy, iz, id
+    real(dp) :: d, rx, ry, rz, ar, phi_x, phi_y, phi_z
+    integer  :: i0, j0, k0
+    real(dp) :: dummy
+
+    ! スレッド割り当て：calc_pstdと同じ構造
+    k   = (blockIdx%x - 1)*blockDim%x + threadIdx%x
+    iy  = threadIdx%y   ! 1..4 → y方向の格子オフセット
+    iz  = threadIdx%z   ! 1..4 → z方向の格子オフセット
+    if (k > dnumpoints) return
+
+    i0 = floor(p_pos(1,k)/ddx) - 1
+    j0 = floor(p_pos(2,k)/ddy) - 1 + iy
+    k0 = floor(p_pos(3,k)/ddz) - 1 + iz
+
+    ! y,z方向のφを計算
+    ry = (real(j0,dp)*ddy - p_pos(2,k)) / ddx
+    rz = (real(k0,dp)*ddz - p_pos(3,k)) / ddx
+
+    ar = abs(ry)
+    if (ar < 1.0_dp) then
+        phi_y = (3.0_dp - 2.0_dp*ar + sqrt(1.0_dp + 4.0_dp*ar - 4.0_dp*ar*ar)) / 8.0_dp
+    else if (ar < 2.0_dp) then
+        phi_y = (5.0_dp - 2.0_dp*ar - sqrt(-7.0_dp + 12.0_dp*ar - 4.0_dp*ar*ar)) / 8.0_dp
+    else
+        phi_y = 0.0_dp
+    end if
+
+    ar = abs(rz)
+    if (ar < 1.0_dp) then
+        phi_z = (3.0_dp - 2.0_dp*ar + sqrt(1.0_dp + 4.0_dp*ar - 4.0_dp*ar*ar)) / 8.0_dp
+    else if (ar < 2.0_dp) then
+        phi_z = (5.0_dp - 2.0_dp*ar - sqrt(-7.0_dp + 12.0_dp*ar - 4.0_dp*ar*ar)) / 8.0_dp
+    else
+        phi_z = 0.0_dp
+    end if
+
+    ! x方向4格子点をループ（体積力がかかる格子点のみ）
+    do ix = i0, i0+3
+        rx = (real(ix,dp)*ddx - p_pos(1,k)) / ddx
+        ar = abs(rx)
+        if (ar < 1.0_dp) then
+            phi_x = (3.0_dp - 2.0_dp*ar + sqrt(1.0_dp + 4.0_dp*ar - 4.0_dp*ar*ar)) / 8.0_dp
+        else if (ar < 2.0_dp) then
+            phi_x = (5.0_dp - 2.0_dp*ar - sqrt(-7.0_dp + 12.0_dp*ar - 4.0_dp*ar*ar)) / 8.0_dp
+        else
+            phi_x = 0.0_dp
+        end if
+
+        d = phi_x * phi_y * phi_z * ds_lat* ds_lat
+
+        ! G(x) += G(X_k) * W(x-X_k) * dV
+        ! dV = ddx*ddy*ddz（格子体積）
+        gx = modulo(ix-1, dNX) + 1
+        gy = modulo(j0-1, dNY) + 1
+        gz = modulo(k0-1, dNZ) + 1
+
+        ! アトミック加算（複数粒子が同じ格子点に寄与する競合を防ぐ）
+
+        dummy = atomicadd(tmpux(gx,gy,gz), Gforce(1,k) * d )
+        dummy = atomicadd(tmpuy(gx,gy,gz), Gforce(2,k) * d )
+        dummy = atomicadd(tmpuz(gx,gy,gz), Gforce(3,k) * d )
+    end do
+
+end subroutine calc_spread
+
+attributes(global) subroutine collide_G() !blockIBでよびだす
+use latticeval
+use localdistfunc
+implicit none
+integer :: k, ix, iy_l, iz_l, gx, gy, gz
+integer :: iy, iz, id
+real(dp) :: d, rx, ry, rz, ar, phi_x, phi_y, phi_z
+integer  :: i0, j0, k0 ,l
+real(dp) :: tmpG(3)
+real(dp) :: dummy
+
+! スレッド割り当て：calc_pstdと同じ構造
+k   = (blockIdx%x - 1)*blockDim%x + threadIdx%x
+iy  = threadIdx%y   ! 1..4 → y方向の格子オフセット
+iz  = threadIdx%z   ! 1..4 → z方向の格子オフセット
+if (k > dnumpoints) return
+
+i0 = floor(p_pos(1,k)/ddx) - 1
+j0 = floor(p_pos(2,k)/ddy) - 1 + iy
+k0 = floor(p_pos(3,k)/ddz) - 1 + iz
+
+! y,z方向のφを計算
+ry = (real(j0,dp)*ddy - p_pos(2,k)) / ddx
+rz = (real(k0,dp)*ddz - p_pos(3,k)) / ddx
+
+ar = abs(ry)
+if (ar < 1.0_dp) then
+    phi_y = (3.0_dp - 2.0_dp*ar + sqrt(1.0_dp + 4.0_dp*ar - 4.0_dp*ar*ar)) / 8.0_dp
+else if (ar < 2.0_dp) then
+    phi_y = (5.0_dp - 2.0_dp*ar - sqrt(-7.0_dp + 12.0_dp*ar - 4.0_dp*ar*ar)) / 8.0_dp
+else
+    phi_y = 0.0_dp
+end if
+
+ar = abs(rz)
+if (ar < 1.0_dp) then
+    phi_z = (3.0_dp - 2.0_dp*ar + sqrt(1.0_dp + 4.0_dp*ar - 4.0_dp*ar*ar)) / 8.0_dp
+else if (ar < 2.0_dp) then
+    phi_z = (5.0_dp - 2.0_dp*ar - sqrt(-7.0_dp + 12.0_dp*ar - 4.0_dp*ar*ar)) / 8.0_dp
+else
+    phi_z = 0.0_dp
+end if
+
+! x方向4格子点をループ（体積力がかかる格子点のみ）
+do ix = i0, i0+3
+    rx = (real(ix,dp)*ddx - p_pos(1,k)) / ddx
+    ar = abs(rx)
+    if (ar < 1.0_dp) then
+        phi_x = (3.0_dp - 2.0_dp*ar + sqrt(1.0_dp + 4.0_dp*ar - 4.0_dp*ar*ar)) / 8.0_dp
+    else if (ar < 2.0_dp) then
+        phi_x = (5.0_dp - 2.0_dp*ar - sqrt(-7.0_dp + 12.0_dp*ar - 4.0_dp*ar*ar)) / 8.0_dp
+    else
+        phi_x = 0.0_dp
+    end if
+
+    d = phi_x * phi_y * phi_z * ds_lat * ds_lat
+    tmpG(1) = d * Gforce(1,k) 
+    tmpG(2) = d * Gforce(2,k)
+    tmpG(3) = d * Gforce(3,k)
+
+    ! G(x) += G(X_k) * W(x-X_k) * dVs
+    ! dV = ddx*ddy*ddz（格子体積）
+    gx = modulo(ix-1, dNX) + 1
+    gy = modulo(j0-1, dNY) + 1
+    gz = modulo(k0-1, dNZ) + 1
+
+    ! アトミック加算（複数粒子が同じ格子点に寄与する競合を防ぐ）
+    do l = 1,dQ
+        d = 3.0_dp * wa(l) * (cx(l)*tmpG(1) + cy(l)*tmpG(2) + cz(l)*tmpG(3))
+        dummy = atomicadd(localdistf(l,gx,gy,gz),d)
+    end do
+end do
+
+end subroutine collide_G
+
+
+end module IBMroutines

@@ -1,0 +1,470 @@
+module LBMroutines
+    use LBMparams
+    implicit none
+    contains    
+    
+    subroutine allocatevals()
+        use LBMparams
+        use cudafor
+        use kinds
+        use boundval
+        use macroval
+        use localdistfunc
+        use latticeval
+        use distfunc
+        use overlap_buf
+        implicit none
+        integer :: i
+        allocate(localdistf(Q,NX,NY,NZ))
+        allocate(rho(NX,NY,NZ),ux(NX,NY,NZ), uy(NX,NY,NZ),uz(NX,NY,NZ),pres(NX,NY,NZ))
+        allocate(rho_d(NX,NY,NZ),ux_d(NX,NY,NZ), uy_d(NX,NY,NZ),uz_d(NX,NY,NZ),pres_d(NX,NY,NZ))
+        allocate(localtmpf(Q,NX,NY,NZ))
+        allocate(f(Q,NX,NY,NZ))
+
+        !----------------------バッファのメモリ領域確保-----------------------------
+        !allocate(rho_buf(NX,NY,NZ));allocate(ux_buf(NX,NY,NZ));allocate(uy_buf(NX,NY,NZ))
+        !allocate(uz_buf(NX,NY,NZ));allocate(pres_buf(NX,NY,NZ))
+        allocate(rho_h(NX,NY,NZ));allocate(ux_h(NX,NY,NZ));allocate(uy_h(NX,NY,NZ))
+        allocate(uz_h(NX,NY,NZ));allocate(pres_h(NX,NY,NZ))
+
+        do i = 1,Q
+            cx(i) = cx1(i)
+            cy(i) = cy1(i)
+            cz(i) = cz1(i)
+            wa(i) = wa2(i)
+            opp(i) = hopp(i)
+        end do
+        do i = 1,3
+            u0(i) = hu0(i)
+        end do
+        dNX = NX; dNY = NY; dNZ = NZ
+        ddx = dx; ddy = dy; ddz = dz;
+        dQ=Q; tau = htau; main_U = hmain_U; delta_t = hdelta_t; RT = hRT
+        omega = homega;
+        uwall= hmain_U
+        !圧力勾配部分
+        rho0 = hrho0
+        rho_in = hrho0 + hdelta_rho
+        rho_in_inv = 1.0_dp/(hrho0 + hdelta_rho)
+        inlet = h_inlet + 1 
+        outlet = h_outlet + 1 
+        rho_out = hrho0 - hdelta_rho
+        inv_dx = 1.0_dp/dx; inv_dy=1/dy; inv_dz = 1/dz;
+    end subroutine allocatevals
+
+    attributes(global) subroutine initialize()
+        use LBMparams
+        use kinds
+        use boundval
+        use localdistfunc
+            use streamtmp
+        use latticeval
+        use macroval
+        use extforce
+
+        implicit none
+
+        integer:: i,j,k,l
+        real(dp) :: tmp,tmp2
+    
+        ! --- スレッド → 格子点対応 ---
+        i = (blockIdx%x-1)*blockDim%x + threadIdx%x
+        j = (blockIdx%y-1)*blockDim%y + threadIdx%y
+        k = (blockIdx%z-1)*blockDim%z + threadIdx%z
+    
+        if (i<=dNX .and. j<=dNY .and. k<=dNZ) then
+    
+            ux(i,j,k) = u0(1)
+            uy(i,j,k) = u0(2)
+            uz(i,j,k) = u0(3)
+    
+            rho(i,j,k) = 1.0_dp
+            pres(i,j,k) = rho(i,j,k)*RT
+    
+            !call calcequil(ux(i,j,k),uy(i,j,k),uz(i,j,k),rho(i,j,k),f0)
+    
+            do l = 1,dQ
+                tmp = cx(l)*ux(i,j,k) + cy(l)*uy(i,j,k) + cz(l)*uz(i,j,k)
+                tmp2 = ux(i,j,k)*ux(i,j,k) + uy(i,j,k)*uy(i,j,k) + uz(i,j,k)*uz(i,j,k)
+                localdistf(l,i,j,k) = wa(l) * rho(i,j,k) * (1.0_dp + 3.0_dp*tmp + 4.5_dp*tmp*tmp - 1.5_dp*tmp2)
+                !localdistf(l,i,j,k) = f0(l)
+            end do
+
+        end if
+
+        !外力の設定
+        forcex = forcex_h *((hdelta_t * hdelta_t)/dx)
+        forcey = forcey_h *((hdelta_t * hdelta_t)/dy)
+        forcez = forcez_h *((hdelta_t * hdelta_t)/dz)
+
+    end subroutine initialize
+
+    attributes(global) subroutine collide()
+        use kinds
+        use LBMparams
+        use localdistfunc
+        use macroval
+        use latticeval
+        use extforce
+
+        implicit none
+        integer:: i,j,k,l
+        real(dp) :: tmp,tmp2
+        !real(dp) :: f0(dQ)
+
+        ! --- スレッド → 格子点 ---
+        i = (blockIdx%x-1)*blockDim%x + threadIdx%x
+        j = (blockIdx%y-1)*blockDim%y + threadIdx%y
+        k = (blockIdx%z-1)*blockDim%z + threadIdx%z
+        if (i<=dNX .and. j<=dNY .and. k<=dNZ) then
+            !call calcequil(ux(i,j,k),uy(i,j,k),uz(i,j,k),rho(i,j,k),f0)
+
+            do l = 1, dQ
+                !平衡分布関数の計算
+                tmp2 = ux(i,j,k)*ux(i,j,k) + uy(i,j,k)*uy(i,j,k) + uz(i,j,k)*uz(i,j,k)
+                tmp = cx(l)*ux(i,j,k) + cy(l)*uy(i,j,k) + cz(l)*uz(i,j,k)
+                tmp2 = wa(l) * rho(i,j,k) * (1.0_dp + 3.0_dp*tmp + 4.5_dp*tmp*tmp - 1.5_dp*tmp2)
+
+                localdistf(l,i,j,k) = localdistf(l,i,j,k) - &
+                    omega * (localdistf(l,i,j,k) - tmp2) + &
+                    3.0d0 * dx * wa(l) * (cx(l)*forcex + cy(l)*forcey + cz(l)*forcez) !外力項部分
+            end do
+        end if
+
+    end subroutine collide
+
+    !$dir inline
+    attributes(device) subroutine calcequil(ux,uy,uz,rho,cf0)
+        use LBMparams
+        use kinds
+        use latticeval
+
+        implicit none
+
+        real(dp), intent(in), value :: ux,uy,uz,rho
+        integer:: i,j,k,l
+        real(dp) :: ctmp,cu2
+        real(dp) ,intent(inout) :: cf0(dQ)
+
+        cu2 = ux*ux + uy*uy + uz*uz
+
+        do l = 1, dQ
+            ctmp = cx(l)*ux + cy(l)*uy + cz(l)*uz
+            cf0(l) = wa(l) * rho * (1.0_dp + 3.0_dp*ctmp + 4.5_dp*ctmp*ctmp - 1.5_dp*cu2)
+        end do
+
+    end subroutine calcequil
+
+    attributes(global) subroutine copy_kernel()
+        use kinds
+        use LBMparams
+        use localdistfunc
+        use streamtmp
+        use latticeval
+        use boundval
+
+        implicit none
+        integer :: i,j,k,l
+
+        i = (blockIdx%x-1)*blockDim%x + threadIdx%x
+        j = (blockIdx%y-1)*blockDim%y + threadIdx%y
+        k = (blockIdx%z-1)*blockDim%z + threadIdx%z
+
+        if (i<=dNX .and. j<=dNY .and. k<=dNZ) then
+            do l = 1,dQ
+                localtmpf(l,i,j,k) = localdistf(l,i,j,k)
+            end do
+        end if
+        
+
+    end subroutine
+
+
+    attributes(global) subroutine streaming()
+        use kinds
+        use LBMparams
+        use localdistfunc
+        use streamtmp
+        use latticeval
+        use boundval
+
+        implicit none
+        integer :: i,j,k,l
+        integer :: i2,j2,k2,i3,j3
+        real(dp) :: tmpuz,tmpx,tmpy
+
+        i = (blockIdx%x-1)*blockDim%x + threadIdx%x
+        j = (blockIdx%y-1)*blockDim%y + threadIdx%y
+        k = (blockIdx%z-1)*blockDim%z + threadIdx%z
+
+        if (i<=dNX .and. j<=dNY .and. k<=dNZ) then
+
+            do l = 1,dQ
+
+            i2 = i - int(cx(l))
+            j2 = j - int(cy(l))
+            k2 = k - int(cz(l))
+
+                if (boundary(i,j,k) == 0) then
+
+                    if (boundary(i2,j2,k2) == 0) then
+
+                        localdistf(l,i,j,k) = localtmpf(l,i2,j2,k2)
+                    else if(abs(boundary(i2,j2,k2)) == 5) then
+                        localdistf(l,i,j,k) = localdistf(l,i2,j2,k2)
+                    else if (boundary(i2,j2,k2) == 1) then
+
+                        localdistf(l,i,j,k) = localtmpf(opp(l),i,j,k)
+
+                    else if (boundary(i2,j2,k2) == 2) then
+                    !print *, "Move Wall"
+                        localdistf(l,i,j,k) = localtmpf(opp(l),i,j,k) + &
+                            2.0_dp * wa(l) * rho0 * 3.0_dp * real(cx(l),dp) * uwall
+
+                    else if (boundary(i2,j2,k2) == 4) then
+
+                        i3 = i2
+                        if (i3 <= 1) then
+                            i3 = dNX-1
+                        else if (i3 >= dNX) then
+                            i3 = 2
+                        end if
+
+                        j3 = j2
+                        if (j3 <= 1) then
+                            j3 = dNY-1
+                        else if (j3 >= dNY) then
+                            j3 = 2
+                        end if
+
+                        localdistf(l,i,j,k) = localtmpf(l,i3,j3,k2) - wa(l) * delta_rho
+
+                    else if (boundary(i2,j2,k2) == -4) then
+
+                        i3 = i2
+                        if (i3 <= 1) then
+                            i3 = dNX-1
+                        else if (i3 >= dNX) then
+                            i3 = 2
+                        end if
+
+                        j3 = j2
+                        if (j3 <= 1) then
+                            j3 = dNY-1
+                        else if (j3 >= dNY) then
+                            j3 = 2
+                        end if
+
+                        localdistf(l,i,j,k) = localtmpf(l,i3,j3,k2) + wa(l) * delta_rho
+                    
+                    else if(boundary(i2,j2,k2) == 11) then
+                        i3 = i2
+                        if (i3 <= 1) then
+                            i3 = dNX-1
+                        else if (i3 >= dNX) then
+                            i3 = 2
+                        end if
+
+                        j3 = j2
+                        if (j3 <= 1) then
+                            j3 = dNY-1
+                        else if (j3 >= dNY) then
+                            j3 = 2
+                        end if
+
+
+                        localdistf(l,i,j,k) = localtmpf(l,i3,j3,k2)
+                    end if
+                else if(boundary(i,j,k) == 5) then 
+                    !何もしない
+                else if(boundary(i,j,k) == -5) then
+                    !何もしない
+                else
+                    localdistf(l,i,j,k) = localtmpf(l,i,j,k)
+                end if
+                if(boundary(i,j,k) == -5) then
+                    !mz = ( f0 + f1 + f2 + f3 + f4 + 2*(f5 + f7 + f10 + f11 + f14) ) - rho_out
+                    tmpuz = ( localtmpf(1,i,j,k) + localtmpf(2,i,j,k) + localtmpf(3,i,j,k) + localtmpf(4,i,j,k) + localtmpf(5,i,j,k) +&
+                    2.0_dp*(localtmpf(6,i,j,k) + localtmpf(8,i,j,k) + localtmpf(11,i,j,k) + localtmpf(12,i,j,k) + localtmpf(15,i,j,k)) ) - rho_out
+                    !tmpuz = -rho_out + ( &
+                    !    localtmpf(0,i,j,k) + localtmpf(1,i,j,k) + localtmpf(2,i,j,k) &
+                    !    + localtmpf(3,i,j,k) + localtmpf(4,i,j,k) &
+                    !    + 2.0_dp*(localtmpf(5,i,j,k)  + localtmpf(7,i,j,k) &
+                    !    + localtmpf(10,i,j,k) + localtmpf(11,i,j,k) &
+                    !    + localtmpf(14,i,j,k)) )
+                    tmpx = localtmpf(2,i,j,k) - localtmpf(3,i,j,k)
+                    tmpy = localtmpf(4,i,j,k) - localtmpf(5,i,j,k)
+                    localdistf(7,i,j,k) = localtmpf(6,i,j,k)  - (2.0_dp/3.0_dp)*tmpuz
+                    localdistf(9,i,j,k) = localtmpf(8,i,j,k)  - tmpuz/12.0_dp + 0.25_dp*( tmpx + tmpy )
+                    localdistf(10,i,j,k) = localtmpf(11,i,j,k) - tmpuz/12.0_dp - 0.25_dp*( tmpx + tmpy )
+                    localdistf(13,i,j,k) = localtmpf(12,i,j,k) - tmpuz/12.0_dp + 0.25_dp*( tmpx - tmpy )
+                    localdistf(14,i,j,k) = localtmpf(15,i,j,k) - tmpuz/12.0_dp - 0.25_dp*( tmpx - tmpy )
+                end if
+
+                if(boundary(i,j,k) == 5) then
+                    !mz = rho_in - ( f0 + f1 + f2 + f3 + f4 + 2*(f6 + f8 + f9 + f12 + f13) )
+                    tmpuz = rho_in - ( localtmpf(1,i,j,k) + localtmpf(2,i,j,k) + localtmpf(3,i,j,k) + localtmpf(4,i,j,k) + localtmpf(5,i,j,k) +&
+                    2.0_dp*(localtmpf(7,i,j,k) + localtmpf(9,i,j,k) + localtmpf(10,i,j,k) + localtmpf(13,i,j,k) + localtmpf(14,i,j,k)) )
+                    !tmpuz = rho_in - (localtmpf(0,i,j,k)+localtmpf(1,i,j,k)+localtmpf(2,i,j,k)+localtmpf(3,i,j,k) + localtmpf(4,i,j,k) +&
+                    !2*(localtmpf(6,i,j,k)+localtmpf(8,i,j,k)+localtmpf(9,i,j,k)+localtmpf(12,i,j,k)+localtmpf(13,i,j,k)))
+                    !localdistf(5,i,j,k) = localtmpf(6,i,j,k) + (2.0_dp/3.0_dp)*tmpuz !z方向
+                    tmpx = localtmpf(2,i,j,k) - localtmpf(3,i,j,k)
+                    tmpy = localtmpf(4,i,j,k) - localtmpf(5,i,j,k)
+                    localdistf(6,i,j,k) = localtmpf(7,i,j,k)  +  (2.0_dp/3.0_dp)*tmpuz
+                    localdistf(8,i,j,k) = localtmpf(9,i,j,k)  + tmpuz/12.0_dp - 0.25_dp*( tmpx + tmpy )
+                    localdistf(11,i,j,k) = localtmpf(10,i,j,k)  + tmpuz/12.0_dp + 0.25_dp*( tmpx + tmpy )
+                    localdistf(12,i,j,k) = localtmpf(13,i,j,k) + tmpuz/12.0_dp - 0.25_dp*( tmpx - tmpy )
+                    localdistf(15,i,j,k) = localtmpf(14,i,j,k) + tmpuz/12.0_dp + 0.25_dp*( tmpx - tmpy )
+                end if
+            end do
+
+            
+
+        end if
+
+    end subroutine streaming
+
+    subroutine setboundary()
+        use LBMparams
+        use boundval
+        use distfunc
+        use macroval
+    
+        implicit none
+        integer i,j,k,n
+        allocate(boundary_d(0:NX+1,0:NY+1,0:NZ+1))
+        allocate(boundary(0:NX+1,0:NY+1,0:NZ+1))
+
+        
+        do k = 0,NZ+1
+            do j=0,NY+1
+                do i = 0,NX+1
+                    boundary_d(i,j,k)=0 !初期化
+                end do
+            end do
+        end do
+
+         !z座標
+
+
+            do j = 0,NY+1
+                do i = 0,NX+1
+                    boundary_d(i,j,0) = 5
+                    boundary_d(i,j,1) = 5
+                end do
+            end do
+            do j = 0,NY+1
+                do i = 0,NX+1
+                    boundary_d(i,j,NZ) = -5 !移動壁
+                    boundary_d(i,j,NZ+1) = -5
+                end do
+            end do
+
+        do k = 0,NZ+1
+            do i = 0,NX+1
+                boundary_d(i,0,k) = 11
+                boundary_d(i,1,k) = 11
+                boundary_d(i,NY,k) = 11
+                boundary_d(i,NY+1,k) = 11
+            end do
+        end do
+        !x座標
+        do k = 0,NZ+1
+            do j = 0,NY+1
+                boundary_d(0,j,k) = 11
+                boundary_d(1,j,k) = 11
+                boundary_d(NX,j,k) = 11
+                boundary_d(NX+1,j,k) = 11
+            end do
+        end do
+       
+
+    end subroutine setboundary
+
+    attributes(global) subroutine calcmacro()
+    use kinds
+    use localdistfunc
+    use LBMparams
+    use boundval
+    use macroval
+    use latticeval
+
+    implicit none
+
+    integer :: i,j,k,c
+    real(dp) :: rho_loc, ux_loc, uy_loc, uz_loc
+
+    ! --- スレッド対応 ---
+    i = (blockIdx%x-1)*blockDim%x + threadIdx%x
+    j = (blockIdx%y-1)*blockDim%y + threadIdx%y
+    k = (blockIdx%z-1)*blockDim%z + threadIdx%z
+
+    if (i<=dNX .and. j<=dNY .and. k<=dNZ) then
+
+        !========================
+        ! rho 計算
+        !========================
+        rho_loc = localdistf(1,i,j,k)
+        do c = 2,dQ
+            rho_loc = rho_loc + localdistf(c,i,j,k)
+        end do
+
+        if (boundary(i,j,k) /= 0) then
+            rho_loc = 1.0_dp
+        end if
+
+        rho(i,j,k) = rho_loc
+        pres(i,j,k) = rho_loc * RT
+
+        !========================
+        ! 速度計算
+        !========================
+        ux_loc = 0.0_dp
+        uy_loc = 0.0_dp
+        uz_loc = 0.0_dp
+
+        if (boundary(i,j,k) == 0) then
+
+            do c = 1,dQ
+                ux_loc = ux_loc + localdistf(c,i,j,k)*cx(c)
+                uy_loc = uy_loc + localdistf(c,i,j,k)*cy(c)
+                uz_loc = uz_loc + localdistf(c,i,j,k)*cz(c)
+            end do
+
+            if (rho_loc > 1.0e-12_dp) then
+                ux_loc = ux_loc / rho_loc
+                uy_loc = uy_loc / rho_loc
+                uz_loc = uz_loc / rho_loc
+            else
+                rho_loc = rho0
+                ux_loc = 0.0_dp
+                uy_loc = 0.0_dp
+                uz_loc = 0.0_dp
+            end if
+
+        else if (boundary(i,j,k) == 2) then
+
+            rho_loc = rho0
+            ux_loc = uwall
+            uy_loc = 0.0_dp
+            uz_loc = 0.0_dp
+
+        else
+            ux_loc = 0.0_dp
+            uy_loc = 0.0_dp
+            uz_loc = 0.0_dp
+        end if
+
+        ux(i,j,k) = ux_loc
+        uy(i,j,k) = uy_loc
+        uz(i,j,k) = uz_loc
+
+    end if
+
+    end subroutine calcmacro
+end module LBMroutines
+
+
+
+
+
