@@ -1,12 +1,12 @@
 # ====== コンパイラ ======
 FC       = mpif90
-FFLAGS = -O3 -cuda -gpu=cc80,ptxinfo -Minfo=accel 
+FFLAGS = -O3 -cuda -gpu=cc121,ptxinfo -Minfo=accel 
 #FFLAGS   = -O0 -cuda -gpu=cc80,debug -g -Ktrap=fp
 TARGET   = Run_lbm3d
 
 # ====== HDF5 ======
 HDF5INC = -I$(HDF5DIR)/include
-HDF5LIB = -L$(HDF5DIR)/lib -lhdf5_fortran -lhdf5 \
+HDF5LIB = -L$(HDF5DIR)/lib -lhdf5_fortran -lhdf5_f90cstub -lhdf5 \
           -Wl,-rpath,$(HDF5DIR)/lib
 
 # ====== ソース ======
