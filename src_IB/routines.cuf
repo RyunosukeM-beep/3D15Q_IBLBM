@@ -109,7 +109,8 @@ module LBMroutines
 
         implicit none
         integer:: i,j,k,l
-        real(dp) :: tmp,tmp2
+        real(dp) :: tmp,feq,fl
+        real(dp) :: uxl,uyl,uzl,rhol,u2,om,fx,fy,fz
         !real(dp) :: f0(dQ)
 
         ! --- スレッド → 格子点 ---
@@ -119,15 +120,21 @@ module LBMroutines
         if (i<=dNX .and. j<=dNY .and. k<=dNZ) then
             !call calcequil(ux(i,j,k),uy(i,j,k),uz(i,j,k),rho(i,j,k),f0)
 
-            do l = 1, dQ
-                !平衡分布関数の計算
-                tmp2 = ux(i,j,k)*ux(i,j,k) + uy(i,j,k)*uy(i,j,k) + uz(i,j,k)*uz(i,j,k)
-                tmp = cx(l)*ux(i,j,k) + cy(l)*uy(i,j,k) + cz(l)*uz(i,j,k)
-                tmp2 = wa(l) * rho(i,j,k) * (1.0_dp + 3.0_dp*tmp + 4.5_dp*tmp*tmp - 1.5_dp*tmp2)
+            ! cycle02: l ループの中で変わらない値は、ループの前に1回だけ読む
+            uxl = ux(i,j,k); uyl = uy(i,j,k); uzl = uz(i,j,k); rhol = rho(i,j,k)
+            u2  = uxl*uxl + uyl*uyl + uzl*uzl
+            om  = omega
+            fx  = forcex; fy = forcey; fz = forcez
 
-                localdistf(l,i,j,k) = localdistf(l,i,j,k) - &
-                    omega * (localdistf(l,i,j,k) - tmp2) + &
-                    3.0_dp * dx * wa(l) * (cx(l)*forcex + cy(l)*forcey + cz(l)*forcez) !外力項部分
+            ! ループ上限は定数 Q、格子速度と重みはコンパイル時定数 cx1,cy1,cz1,wa2
+            do l = 1, Q
+                !平衡分布関数の計算
+                tmp = cx1(l)*uxl + cy1(l)*uyl + cz1(l)*uzl
+                feq = wa2(l) * rhol * (1.0_dp + 3.0_dp*tmp + 4.5_dp*tmp*tmp - 1.5_dp*u2)
+
+                fl = localdistf(l,i,j,k)
+                localdistf(l,i,j,k) = fl - om * (fl - feq) + &
+                    3.0_dp * dx * wa2(l) * (cx1(l)*fx + cy1(l)*fy + cz1(l)*fz) !外力項部分
             end do
         end if
 
