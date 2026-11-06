@@ -127,7 +127,7 @@ module LBMroutines
 
                 localdistf(l,i,j,k) = localdistf(l,i,j,k) - &
                     omega * (localdistf(l,i,j,k) - tmp2) + &
-                    3.0d0 * dx * wa(l) * (cx(l)*forcex + cy(l)*forcey + cz(l)*forcez) !外力項部分
+                    3.0_dp * dx * wa(l) * (cx(l)*forcex + cy(l)*forcey + cz(l)*forcez) !外力項部分
             end do
         end if
 
